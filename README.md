@@ -9,8 +9,6 @@
 python3 -m venv venv
 #仮想環境のアクティベート
 source venv/bin/activate
-# 依存関係の保存
-pip freeze > requirements.txt
 # 依存関係のインストール
 pip install -r requirements.txt
 ```
@@ -27,5 +25,10 @@ cp .env_copy .env
 
 ```bash
 python ./src/2_simple_transfer.py
+```
 
+## 依存関係の保存
+
+```bash
+pip freeze >! requirements.txt
 ```

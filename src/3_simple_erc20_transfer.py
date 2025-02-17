@@ -1,11 +1,12 @@
 import os
 from web3 import Web3
 from dotenv import load_dotenv
+from decimal import Decimal, getcontext
 
 load_dotenv()
 
-# 接続先（例：Arbitrum OneのRPCエンドポイント）
-w3 = Web3(Web3.HTTPProvider("https://arb1.arbitrum.io/rpc"))
+# 接続先（例：BSCのRPCエンドポイント）
+w3 = Web3(Web3.HTTPProvider("https://bsc.drpc.org"))
 
 # 環境変数から秘密鍵を取得し、送信元アドレスを導出
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -14,13 +15,14 @@ SENDER_ADDRESS = w3.eth.account.from_key(PRIVATE_KEY).address
 # 送金先アドレスの設定（例）
 recipient = "0xRecipientAddressHere"  # 送金先アドレスを設定
 
-recipient = "0x13d315886975d8A2882407a8433Ca5c354eBF15E"
+# USDTのコントラクトアドレス（bsc）
+USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955"
 
-# 送金額（USDCの最小単位：6桁の場合 1 USDC = 1_000_000）
-amount_usdc = 200_000  # 例：0.2 USDCなら200_000（USDCは6桁が一般的）
+# 送金額（decimal考慮前で良い）
+amount_usdt = 0.001
 
-# arbitrumのチェーンID（未指定の場合は内部でデフォルト値を採用）
-default_chain_id = 42161
+# bscのチェーンID（未指定の場合は内部でデフォルト値を採用）
+default_chain_id = 56
 
 # USDCのERC20コントラクトABI（必要最低限：balanceOf, transfer）
 ERC20_ABI = [
@@ -41,28 +43,49 @@ ERC20_ABI = [
         "outputs": [{"name": "", "type": "bool"}],
         "type": "function",
     },
+    {   
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"internalType":"uint8","name":"","type":"uint8"}],
+        "payable": False,
+        "stateMutability": "view",
+        "type": "function"
+    },
 ]
-
-# ※ USDCのコントラクトアドレス（Arbitrumの場合の例、環境に合わせて変更してください）
-USDC_ADDRESS = "0xFF970A61A04b1CA14834A43f5dE4533eBDDB5CC8"
 
 def get_token_contract(token_address):
     """ 指定されたアドレスのERC20トークンコントラクトを取得する """
     return w3.eth.contract(address=token_address, abi=ERC20_ABI)
+
+def get_decimals(token_contract):
+    """トークンの小数点桁数を取得する"""
+    try:
+        return token_contract.functions.decimals().call()
+    except Exception as e:
+        print("decimalsの取得エラー:", e)
+        # エラー時はデフォルト値（例: 18）を返す
+        return 18
 
 def print_token_balances(token_contract, sender, receiver, label="トークン残高"):
     """
     送信元・受信先のERC20トークン残高を表示する  
     ※ トークンによって小数点以下の桁数は異なるため、ここでは生の数値を表示
     """
+    decimals = get_decimals(token_contract)
     sender_balance = token_contract.functions.balanceOf(sender).call()
     receiver_balance = token_contract.functions.balanceOf(receiver).call()
+    
+    # Decimalで整形（例: USDTなら小数点以下6桁）
+    sender_formatted = Decimal(sender_balance) / (10 ** decimals)
+    receiver_formatted = Decimal(receiver_balance) / (10 ** decimals)
+
     print(f"{label}確認:")
-    print(f"  Sender ({sender}): {sender_balance}")
-    print(f"  Receiver ({receiver}): {receiver_balance}")
+    print(f"  Sender ({sender}): {sender_formatted} (raw: {sender_balance})")
+    print(f"  Receiver ({receiver}): {receiver_formatted} (raw: {receiver_balance})")
     print("-" * 40)
 
-def create_token_transaction(sender, receiver, amount, chain_id=None):
+def create_token_transaction(sender, receiver, token_contract, amount, chain_id=None):
     """
     ERC20トークン送信用トランザクション情報を作成する  
     引数 chain_id が指定されなければ、デフォルト値を採用する
@@ -85,13 +108,18 @@ def create_token_transaction(sender, receiver, amount, chain_id=None):
     print(f"Gas Price: {w3.from_wei(gas_price, 'gwei')} Gwei")
     tx['gasPrice'] = gas_price
 
-    # トークンのtransfer関数の呼び出しトランザクションをビルド
-    token_contract = get_token_contract(USDC_ADDRESS)
-    transfer_tx = token_contract.functions.transfer(receiver, amount).build_transaction(tx)
+    decimals = get_decimals(token_contract)
+    # Decimalを利用して送金額を単位変換
+    # 例えば、amountが "1.5" USDT で decimals が6なら、
+    # converted_amount = int(Decimal("1.5") * (10 ** 6)) → 1500000
+    converted_amount = int(Decimal(amount) * (10 ** decimals))
+    print(f"Amount: {amount}, Converted Amount: {converted_amount}")
+
+    transfer_tx = token_contract.functions.transfer(receiver, converted_amount).build_transaction(tx)
 
     # オンチェーンでガスリミットを見積もる
     estimated_gas = w3.eth.estimate_gas(transfer_tx)
-    transfer_tx['gas'] = int(estimated_gas * 1.2)  # 余裕を持たせる
+    transfer_tx['gas'] = int(estimated_gas * 1.2) 
     print(f"Estimated Gas: {estimated_gas}, Using Gas: {transfer_tx['gas']}")
     return transfer_tx
 
@@ -106,19 +134,19 @@ def sign_and_send_transaction(tx, private_key):
 
 def safe_transfer_usdc(receiver, amount, chain_id=None):
     """
-    USDC送金の一連の処理を実行する  
+    ERC20送金の一連の処理を実行する  
     ・送金前のトークン残高確認  
     ・トランザクション作成、署名、送信  
     ・トランザクション完了待ち  
     ・送金後のトークン残高確認
     """
     try:
-        token_contract = get_token_contract(USDC_ADDRESS)
+        token_contract = get_token_contract(USDT_ADDRESS)
         # 送金前の残高確認
         print_token_balances(token_contract, SENDER_ADDRESS, receiver, label="送金前のトークン残高")
 
         # トランザクション作成
-        tx = create_token_transaction(SENDER_ADDRESS, receiver, amount, chain_id)
+        tx = create_token_transaction(SENDER_ADDRESS, receiver, token_contract, amount, chain_id)
         print("生成されたトランザクション:", tx)
 
         # 署名＆送信
@@ -136,4 +164,4 @@ def safe_transfer_usdc(receiver, amount, chain_id=None):
 
 # ================================
 # USDC送金の実行例
-safe_transfer_usdc(recipient, amount_usdc)
+safe_transfer_usdc(recipient, amount_usdt)
